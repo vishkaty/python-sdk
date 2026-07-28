@@ -38,6 +38,17 @@ try:
     from ucp_sdk.models.schemas.shopping.types.totals_update_request import (
         TotalsUpdateRequest,
     )
+    from ucp_sdk.models.schemas.shopping.discount import AppliedDiscount
+    from ucp_sdk.models.schemas.shopping.types.card_payment_instrument import (
+        Constraints,
+    )
+    from ucp_sdk.models.schemas.shopping.types.context import Context
+    from ucp_sdk.models.schemas.shopping.types.context_create_request import (
+        ContextCreateRequest,
+    )
+    from ucp_sdk.models.schemas.shopping.types.context_update_request import (
+        ContextUpdateRequest,
+    )
 
     HAVE_SDK = True
 except ImportError:  # pragma: no cover
@@ -830,6 +841,252 @@ class ArrayContainsInjectorTest(unittest.TestCase):
             with self.assertRaises(ValidationError):
                 adapter.validate_python(bad)
         adapter.validate_python([sub, tot])
+
+
+@unittest.skipUnless(
+    HAVE_SDK, "requires the installed package (pip install -e .)"
+)
+class BrandsUniqueItemsTest(unittest.TestCase):
+    """card_payment_instrument.json: constraints.brands is uniqueItems: true.
+
+    The generator emits ``brands: list[str]`` (only ``minItems`` survives as
+    ``min_length``); array-item uniqueness is dropped. The post-generation
+    injector restores it as a ``model_validator`` scoped to the ``Constraints``
+    class.
+    """
+
+    def test_duplicate_brands_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "unique"):
+            Constraints.model_validate({"brands": ["visa", "visa"]})
+
+    def test_distinct_brands_accepted(self):
+        self.assertEqual(
+            Constraints.model_validate(
+                {"brands": ["visa", "mastercard"]}
+            ).brands,
+            ["visa", "mastercard"],
+        )
+
+    def test_absent_brands_accepted(self):
+        # uniqueItems only constrains the array when it is present.
+        Constraints.model_validate({})
+        Constraints.model_validate({"brands": None})
+
+    def test_empty_brands_accepted(self):
+        # min_length (minItems) is a separate constraint; [] tests uniqueness
+        # alone would pass, so use the model default to avoid tripping it.
+        Constraints.model_validate({"brands": ["visa"]})
+
+
+@unittest.skipUnless(
+    HAVE_SDK, "requires the installed package (pip install -e .)"
+)
+class EligibilityUniqueItemsTest(unittest.TestCase):
+    """context.json: eligibility is a uniqueItems: true array of domains.
+
+    The bound must reach the base ``Context`` and its generated request
+    variants, and must NOT leak onto ``AppliedDiscount.eligibility`` (a scalar
+    of the same name).
+    """
+
+    DOMAIN_A = "com.example.loyalty_gold"
+    DOMAIN_B = "org.school.student"
+
+    def _reject_dupes(self, cls):
+        with (
+            self.subTest(model=cls.__name__),
+            self.assertRaisesRegex(ValidationError, "unique"),
+        ):
+            cls.model_validate({"eligibility": [self.DOMAIN_A, self.DOMAIN_A]})
+
+    def _accept_distinct(self, cls):
+        with self.subTest(model=cls.__name__):
+            got = cls.model_validate(
+                {"eligibility": [self.DOMAIN_A, self.DOMAIN_B]}
+            )
+            self.assertEqual(len(got.eligibility), 2)
+
+    def test_base_and_variants_reject_duplicates(self):
+        for cls in (Context, ContextCreateRequest, ContextUpdateRequest):
+            self._reject_dupes(cls)
+
+    def test_base_and_variants_accept_distinct(self):
+        for cls in (Context, ContextCreateRequest, ContextUpdateRequest):
+            self._accept_distinct(cls)
+
+
+@unittest.skipUnless(
+    HAVE_SDK, "requires the installed package (pip install -e .)"
+)
+class UniqueItemsDisjointnessTest(unittest.TestCase):
+    """The uniqueItems bound must not leak onto same-named scalar fields.
+
+    ``AppliedDiscount.eligibility`` is a single ``ReverseDomainName`` (no
+    uniqueItems); the injector's list-type guard must leave it untouched, so a
+    valid instance still validates and the field stays a scalar.
+    """
+
+    def test_scalar_eligibility_field_unconstrained(self):
+        got = AppliedDiscount.model_validate(
+            {
+                "title": "Loyalty",
+                "amount": 100,
+                "eligibility": "com.example.loyalty_gold",
+            }
+        )
+        self.assertEqual(got.eligibility, "com.example.loyalty_gold")
+
+    def test_no_unique_validator_injected_into_applied_discount(self):
+        # The guard is structural: AppliedDiscount must carry no uniqueItems
+        # validator method at all.
+        self.assertFalse(
+            any(
+                name.startswith("_enforce_unique_items_")
+                for name in vars(AppliedDiscount)
+            )
+        )
+
+
+class UniqueItemsInjectorTest(unittest.TestCase):
+    """The uniqueItems injector's own behavior."""
+
+    MODULE = (
+        "from __future__ import annotations\n"
+        "\n"
+        "from pydantic import BaseModel, ConfigDict, Field\n"
+        "\n"
+        "\n"
+        "class Constraints(BaseModel):\n"
+        '    """Sample."""\n'
+        "\n"
+        '    model_config = ConfigDict(extra="allow")\n'
+        "    brands: list[str] | None = Field(None, min_length=1)\n"
+        "    label: str | None = None\n"
+    )
+
+    def test_scan_finds_array_unique_items(self):
+        schema = {
+            "title": "Context",
+            "type": "object",
+            "allOf": [
+                {
+                    "properties": {
+                        "eligibility": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "uniqueItems": True,
+                        }
+                    }
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "context.json").write_text(json.dumps(schema))
+            found = postprocess_models.find_unique_items_constraints(Path(tmp))
+        self.assertEqual(found, {"Context": {"eligibility"}})
+
+    def test_scan_finds_nested_object_owner(self):
+        # brands lives on a nested `constraints` object -> class Constraints.
+        schema = {
+            "title": "Available Card Payment Instrument",
+            "type": "object",
+            "properties": {
+                "constraints": {
+                    "type": "object",
+                    "properties": {
+                        "brands": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "uniqueItems": True,
+                        }
+                    },
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "card.json").write_text(json.dumps(schema))
+            found = postprocess_models.find_unique_items_constraints(Path(tmp))
+        self.assertEqual(found, {"Constraints": {"brands"}})
+
+    def test_scan_ignores_conditional_unique_items(self):
+        # uniqueItems reachable only through an if/then branch is conditional
+        # (e.g. required_claims when type==oauth2) and must NOT be injected.
+        schema = {
+            "title": "Provider",
+            "type": "object",
+            "allOf": [
+                {
+                    "if": {"properties": {"type": {"const": "oauth2"}}},
+                    "then": {
+                        "properties": {
+                            "required_claims": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "uniqueItems": True,
+                            }
+                        }
+                    },
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "p.json").write_text(json.dumps(schema))
+            found = postprocess_models.find_unique_items_constraints(Path(tmp))
+        self.assertEqual(found, {})
+
+    def test_scan_ignores_non_array_unique_items(self):
+        schema = {
+            "title": "Weird",
+            "type": "object",
+            "properties": {"x": {"type": "string", "uniqueItems": True}},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "w.json").write_text(json.dumps(schema))
+            found = postprocess_models.find_unique_items_constraints(Path(tmp))
+        self.assertEqual(found, {})
+
+    def test_injects_validator_and_import(self):
+        out = postprocess_models.inject_unique_items(
+            self.MODULE, "Constraints", "brands"
+        )
+        self.assertIn("_enforce_unique_items_brands", out)
+        self.assertIn("model_validator", out)
+        self.assertRegex(out, r"from pydantic import .*model_validator")
+
+    def test_does_not_inject_when_field_not_a_list(self):
+        # The `label` field is a scalar; the guard must refuse it.
+        out = postprocess_models.inject_unique_items(
+            self.MODULE, "Constraints", "label"
+        )
+        self.assertEqual(out, self.MODULE)
+
+    def test_does_not_inject_into_missing_class(self):
+        out = postprocess_models.inject_unique_items(
+            self.MODULE, "Nonexistent", "brands"
+        )
+        self.assertEqual(out, self.MODULE)
+
+    def test_injection_is_idempotent(self):
+        once = postprocess_models.inject_unique_items(
+            self.MODULE, "Constraints", "brands"
+        )
+        twice = postprocess_models.inject_unique_items(
+            once, "Constraints", "brands"
+        )
+        self.assertEqual(once, twice)
+
+    @unittest.skipUnless(HAVE_SDK, "executing the module needs pydantic")
+    def test_injected_validator_enforces_uniqueness(self):
+        out = postprocess_models.inject_unique_items(
+            self.MODULE, "Constraints", "brands"
+        )
+        namespace: dict = {}
+        exec(compile(out, "<injected>", "exec"), namespace)  # noqa: S102
+        cls = namespace["Constraints"]
+        with self.assertRaises(ValidationError):
+            cls(brands=["visa", "visa"])
+        self.assertEqual(cls(brands=["visa", "mc"]).brands, ["visa", "mc"])
+        cls()  # absent array is fine
 
 
 if __name__ == "__main__":

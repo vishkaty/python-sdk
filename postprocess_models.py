@@ -48,6 +48,18 @@ preprocessed output were scanned. generate_models.sh snapshots the originals to
 applied to the base model and to its generated request variants (linked by file
 stem), and travels wherever the alias is reused as a field type.
 
+``uniqueItems`` on an array field is also dropped: the generator maps an array
+to a bare ``list[...]`` and never enforces item uniqueness, so
+``constraints.brands`` and ``context.eligibility`` accept duplicates in
+violation of the schema. This script injects a ``model_validator(mode="after")``
+that rejects duplicate items (structural equality via ``model_dump`` for model
+items). The injection is object- and field-scoped: it is appended only to the
+class the constraint belongs to and only when that field is a ``list`` there, so
+a same-named scalar field on another model (``AppliedDiscount.eligibility``) is
+never touched. Constraints reachable only through an ``if``/``then`` branch are
+conditional and deliberately left alone. Scanned from the pristine schemas for
+the same allOf-merge reason as the contains bounds.
+
 Runs from generate_models.sh between generation and formatting; idempotent.
 """
 
@@ -321,6 +333,218 @@ def inject_array_contains(source, alias_name, groups):
     return _ensure_pydantic_import(out, "AfterValidator")
 
 
+_UNIQUE_MARKER_PREFIX = "_enforce_unique_items_"
+
+_UNIQUE_TEMPLATE = '''
+    @model_validator(mode="after")
+    def {marker}(self):
+        """JSON Schema uniqueItems on {field!r}: array items must be unique."""
+        _items = self.{field}
+        if _items is not None:
+            _seen = []
+            for _item in _items:
+                _key = (
+                    _item.model_dump(mode="json")
+                    if hasattr(_item, "model_dump")
+                    else _item
+                )
+                if _key in _seen:
+                    raise ValueError(
+                        "{field} items must be unique "
+                        "(schema uniqueItems=true)"
+                    )
+                _seen.append(_key)
+        return self
+'''
+
+
+def _class_name(key):
+    """Datamodel-code-generator class name for a schema title or property key.
+
+    ``available_card_payment_instrument`` / ``Available Card Payment
+    Instrument`` -> ``AvailableCardPaymentInstrument``; ``constraints`` ->
+    ``Constraints``; ``Context`` -> ``Context``.
+    """
+    words = [w for w in re.split(r"[^0-9A-Za-z]+", key) if w]
+    return "".join(w[:1].upper() + w[1:] for w in words)
+
+
+def _is_object_schema(spec):
+    """True when a subschema names its own (nested) object type."""
+    return spec.get("type") == "object" or isinstance(
+        spec.get("properties"), dict
+    )
+
+
+def _collect_unique_items(node, owner, conditional, out):
+    """Record ``owner_class -> {array field}`` for every uniqueItems: true.
+
+    Only *unconditional* array constraints are collected: a uniqueItems that is
+    reachable only through an ``if``/``then``/``else``/``not`` branch (e.g.
+    ``required_claims`` present only when ``type == "oauth2"``) is a conditional
+    rule the generator legitimately drops, and enforcing it unconditionally
+    would reject spec-valid data. ``owner`` tracks the class the generator emits
+    for the enclosing object (schema title at the root; the PascalCased property
+    key for a nested object), so the bound lands on the right class and field.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _collect_unique_items(item, owner, conditional, out)
+        return
+    if not isinstance(node, dict):
+        return
+    props = node.get("properties")
+    if isinstance(props, dict):
+        for field, spec in props.items():
+            if not isinstance(spec, dict):
+                continue
+            is_array = spec.get("type") == "array" or "items" in spec
+            if spec.get("uniqueItems") is True and is_array and not conditional:
+                out.setdefault(owner, set()).add(field)
+            child_owner = (
+                _class_name(field) if _is_object_schema(spec) else owner
+            )
+            _collect_unique_items(spec, child_owner, conditional, out)
+    for key, value in node.items():
+        if key == "properties":
+            continue
+        if key == "$defs" and isinstance(value, dict):
+            for def_key, def_val in value.items():
+                _collect_unique_items(
+                    def_val, _class_name(def_key), conditional, out
+                )
+            continue
+        child_conditional = conditional or key in ("if", "then", "else", "not")
+        _collect_unique_items(value, owner, child_conditional, out)
+
+
+def find_unique_items_constraints(schema_dir):
+    """Map generated class name -> set of array fields with uniqueItems: true.
+
+    Scanned against the pristine schemas so an allOf-merged branch's uniqueItems
+    is not lost to preprocessing. Conditional (``if``/``then``) occurrences are
+    excluded; see ``_collect_unique_items``.
+    """
+    found = {}
+    for path in sorted(Path(schema_dir).rglob("*.json")):
+        try:
+            schema = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(schema, dict):
+            continue
+        owner = _class_name(schema.get("title") or path.stem)
+        _collect_unique_items(schema, owner, False, found)
+    return found
+
+
+def _class_body_bounds(source, class_name):
+    """Return (start, end) offsets of ``class_name``'s body, or None."""
+    class_re = re.compile(rf"^class {re.escape(class_name)}\(", re.M)
+    match = class_re.search(source)
+    if not match:
+        return None
+    tail = re.compile(r"^\S", re.M)
+    end_match = tail.search(source, match.end())
+    end = end_match.start() if end_match else len(source)
+    return match.start(), end
+
+
+def _field_is_list(body, field):
+    """True when ``field``'s annotation in a class body is a ``list[...]``.
+
+    Handles the parenthesised multi-line annotations the generator emits for
+    reused variant types (``eligibility: (\\n    list[...] | None\\n) = ...``).
+    """
+    decl = re.search(rf"^    {re.escape(field)}:", body, re.M)
+    if not decl:
+        return False
+    nxt = re.search(r"^    \w+:", body[decl.end() :], re.M)
+    chunk = (
+        body[decl.end() : decl.end() + nxt.start()]
+        if nxt
+        else body[decl.end() :]
+    )
+    return "list[" in chunk
+
+
+def inject_unique_items(source, class_name, field):
+    """Inject a uniqueItems ``model_validator`` into ``class_name``.
+
+    Object- and field-scoped: the method is appended to the *specific* class's
+    body and only when ``field`` is a ``list`` there, so a same-named scalar
+    field on another class (``AppliedDiscount.eligibility``) is never touched.
+    Idempotent via the per-field method name.
+    """
+    marker = f"{_UNIQUE_MARKER_PREFIX}{field}"
+    bounds = _class_body_bounds(source, class_name)
+    if not bounds:
+        return source
+    start, end = bounds
+    body = source[start:end]
+    if f"def {marker}(" in body:
+        return source
+    if not _field_is_list(body, field):
+        return source
+    method = _UNIQUE_TEMPLATE.format(marker=marker, field=field)
+    head = source[:end].rstrip("\n")
+    rest = source[end:]
+    out = head + "\n" + method + ("\n" + rest if rest else "")
+    return _ensure_pydantic_import(out, "model_validator")
+
+
+def _patch_unique_items():
+    """Inject uniqueItems validators; return (patched_count, exit_code)."""
+    targets = find_unique_items_constraints(RAW_SCHEMA_DIR)
+    if not targets:
+        targets = find_unique_items_constraints(SCHEMA_DIR)
+        if targets:
+            sys.stderr.write(
+                f"  ! {RAW_SCHEMA_DIR} missing; falling back to preprocessed "
+                "schemas for uniqueItems\n"
+            )
+    if not targets:
+        sys.stdout.write("postprocess: no uniqueItems constraints found\n")
+        return 0, 0
+    patched = 0
+    for class_name, fields in sorted(targets.items()):
+        # A root object's request variants carry renamed classes; a nested
+        # object keeps its name across variant files. Cover both.
+        variants = [
+            class_name,
+            f"{class_name}CreateRequest",
+            f"{class_name}UpdateRequest",
+        ]
+        for field in sorted(fields):
+            hits = []
+            for path in sorted(OUTPUT_DIR.rglob("*.py")):
+                source = path.read_text(encoding="utf-8")
+                updated = source
+                for variant in variants:
+                    updated = inject_unique_items(updated, variant, field)
+                    if re.search(
+                        rf"^class {re.escape(variant)}\(", updated, re.M
+                    ) and _field_is_list(
+                        updated[slice(*_class_body_bounds(updated, variant))],
+                        field,
+                    ):
+                        hits.append(f"{path}:{variant}")
+                if updated != source:
+                    path.write_text(updated, encoding="utf-8")
+                    patched += 1
+            label = ", ".join(sorted(set(hits))) or "NO GENERATED CLASS FOUND"
+            sys.stdout.write(
+                f"  uniqueItems on {class_name}.{field} -> {label}\n"
+            )
+            if not hits:
+                sys.stderr.write(
+                    f"  ! uniqueItems {class_name}.{field}: no list-typed "
+                    "field on any generated class; constraint not enforced\n"
+                )
+                return patched, 1
+    return patched, 0
+
+
 def _patch_min_properties():
     """Inject minProperties validators; return (patched_count, exit_code)."""
     constraints = find_root_min_properties(SCHEMA_DIR)
@@ -429,9 +653,10 @@ def main():
     """Main entry point to scan schemas and patch generated models."""
     patched_mp, rc_mp = _patch_min_properties()
     patched_ac, rc_ac = _patch_array_contains()
-    total = patched_mp + patched_ac
+    patched_ui, rc_ui = _patch_unique_items()
+    total = patched_mp + patched_ac + patched_ui
     sys.stdout.write(f"postprocess: {total} module(s) patched\n")
-    return rc_mp or rc_ac
+    return rc_mp or rc_ac or rc_ui
 
 
 if __name__ == "__main__":
